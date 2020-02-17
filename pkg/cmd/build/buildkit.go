@@ -27,9 +27,7 @@ import (
 )
 
 const (
-	frontend          = "dockerfile.v0"
-	buildKitContainer = "buildkit-0"
-	buildKitPort      = 1234
+	frontend = "dockerfile.v0"
 )
 
 //GetBuildKitHost returns thee buildkit url
