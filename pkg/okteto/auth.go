@@ -182,15 +182,15 @@ func GetRegistry() string {
 }
 
 // GetBuildKit returns the URL of the okteto buildkit
-func GetBuildKit() string {
+func GetBuildKit() (string, error) {
 	t, err := GetToken()
 	if err != nil {
-		return fmt.Sprintf("tcp://%s", CloudBuildKitURL)
+		return "", err
 	}
 	if t.Buildkit == "" {
-		return fmt.Sprintf("tcp://%s", CloudBuildKitURL)
+		return fmt.Sprintf("tcp://%s", CloudBuildKitURL), nil
 	}
-	return fmt.Sprintf("tcp://%s", t.Buildkit)
+	return fmt.Sprintf("tcp://%s", t.Buildkit), nil
 }
 
 func saveToken(id, token, url, registry, buildkit string) error {

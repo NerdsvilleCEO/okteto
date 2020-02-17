@@ -14,34 +14,22 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/containerd/console"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/okteto/okteto/pkg/analytics"
-	"github.com/okteto/okteto/pkg/buildkit"
-	"github.com/okteto/okteto/pkg/config"
+	"github.com/okteto/okteto/pkg/cmd/build"
 	"github.com/okteto/okteto/pkg/log"
 	"github.com/okteto/okteto/pkg/okteto"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
-)
-
-const (
-	frontend          = "dockerfile.v0"
-	buildKitContainer = "buildkit-0"
-	buildKitPort      = 1234
 )
 
 //Build build and optionally push a Docker image
@@ -56,7 +44,7 @@ func Build() *cobra.Command {
 		Short: "Build (and optionally push) a Docker image",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			log.Debug("starting build command")
-			if err := RunBuild(args[0], file, tag, target, noCache); err != nil {
+			if _, err := RunBuild(args[0], file, tag, target, noCache); err != nil {
 				analytics.TrackBuild(false)
 				return err
 			}
@@ -79,20 +67,28 @@ func Build() *cobra.Command {
 }
 
 //RunBuild starts the build sequence
-func RunBuild(path, file, tag, target string, noCache bool) error {
+func RunBuild(path, file, tag, target string, noCache bool) (string, error) {
 	ctx := context.Background()
 
-	buildKitHost, err := getBuildKitHost()
+	buildKitHost, err := build.GetBuildKitHost()
 	if err != nil {
-		return err
+		return "", fmt.Errorf("'BUILDKIT_HOST' not set. You can run 'okteto login' to run your builds in Okteto Cloud for free")
+	}
+	oktetoBuildKit, _ := okteto.GetBuildKit()
+	if oktetoBuildKit != buildKitHost {
+		log.Information("Running your build in %s...", buildKitHost)
+	} else {
+		if strings.Contains(buildKitHost, okteto.CloudBuildKitURL) {
+			log.Information("Running your build in Okteto Cloud...")
+		} else {
+			log.Information("Running your build in Okteto Enterprise...")
+		}
 	}
 
 	c, err := client.New(ctx, buildKitHost, client.WithFailFast())
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	log.Infof("created buildkit client: %+v", c)
 
 	ch := make(chan *client.SolveStatus)
 	eg, ctx := errgroup.WithContext(ctx)
@@ -100,23 +96,29 @@ func RunBuild(path, file, tag, target string, noCache bool) error {
 	if file == "" {
 		file = filepath.Join(path, "Dockerfile")
 	}
-	if buildKitHost == okteto.GetBuildKit() {
-		fileWithCacheHandler, err := getFileWithCacheHandler(file)
+	if buildKitHost == oktetoBuildKit {
+		fileWithCacheHandler, err := build.GetDockerfileWithCacheHandler(file)
 		if err != nil {
-			return fmt.Errorf("failed to create temporary build folder: %s", err)
+			return "", fmt.Errorf("failed to create temporary build folder: %s", err)
 		}
 
 		defer os.Remove(fileWithCacheHandler)
 		file = fileWithCacheHandler
 	}
 
-	solveOpt, err := getSolveOpt(path, file, tag, target, noCache)
+	solveOpt, err := build.GetSolveOpt(path, file, tag, target, noCache)
 	if err != nil {
-		return err
+		return "", err
 	}
 
+	if tag == "" {
+		log.Information("Your image won't be pushed. To push your image specify the flag '-t'.")
+	}
+
+	var solveResp *client.SolveResponse
 	eg.Go(func() error {
-		_, err := c.Solve(ctx, nil, *solveOpt, ch)
+		var err error
+		solveResp, err = c.Solve(ctx, nil, *solveOpt, ch)
 		return err
 	})
 
@@ -130,160 +132,8 @@ func RunBuild(path, file, tag, target string, noCache bool) error {
 	})
 
 	if err := eg.Wait(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func getBuildKitHost() (string, error) {
-	buildKitHost := os.Getenv("BUILDKIT_HOST")
-	if buildKitHost != "" {
-		return buildKitHost, nil
-	}
-	return okteto.GetBuildKit(), nil
-}
-
-func getSolveOpt(buildCtx, file, imageTag, target string, noCache bool) (*client.SolveOpt, error) {
-	localDirs := map[string]string{
-		"context":    buildCtx,
-		"dockerfile": filepath.Dir(file),
-	}
-
-	frontendAttrs := map[string]string{
-		"filename": filepath.Base(file),
-	}
-	if target != "" {
-		frontendAttrs["target"] = target
-	}
-	if noCache {
-		frontendAttrs["no-cache"] = ""
-	}
-
-	attachable := []session.Attachable{}
-	if strings.HasPrefix(imageTag, okteto.GetRegistry()) {
-		// set Okteto Cloud credentials
-		token, err := okteto.GetToken()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read okteto token. Did you run 'okteto login'?")
-		}
-		attachable = append(attachable, buildkit.NewDockerAndOktetoAuthProvider(okteto.GetUserID(), token.Token, os.Stderr))
-	} else {
-		// read docker credentials from `.docker/config.json`
-		attachable = append(attachable, authprovider.NewDockerAuthProvider(os.Stderr))
-	}
-
-	opt := &client.SolveOpt{
-		LocalDirs:     localDirs,
-		Frontend:      frontend,
-		FrontendAttrs: frontendAttrs,
-		Session:       attachable,
-	}
-
-	if imageTag != "" {
-		opt.Exports = []client.ExportEntry{
-			{
-				Type: "image",
-				Attrs: map[string]string{
-					"name": imageTag,
-					"push": "true",
-				},
-			},
-		}
-		opt.CacheExports = []client.CacheOptionsEntry{
-			{
-				Type: "inline",
-			},
-		}
-		opt.CacheImports = []client.CacheOptionsEntry{
-			{
-				Type:  "registry",
-				Attrs: map[string]string{"ref": imageTag},
-			},
-		}
-	}
-
-	return opt, nil
-}
-
-func getRepoNameWithoutTag(name string) string {
-	var domain, remainder string
-	i := strings.IndexRune(name, '/')
-	if i == -1 || (!strings.ContainsAny(name[:i], ".:") && name[:i] != "localhost") {
-		domain, remainder = "", name
-	} else {
-		domain, remainder = name[:i], name[i+1:]
-	}
-	i = strings.LastIndex(remainder, ":")
-	if i == -1 {
-		return name
-	}
-	if domain == "" {
-		return remainder[:i]
-	}
-	return fmt.Sprintf("%s/%s", domain, remainder[:i])
-}
-
-func getFileWithCacheHandler(filename string) (string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-
-	dockerfileTmpFolder := filepath.Join(config.GetHome(), ".dockerfile")
-
-	if err := os.MkdirAll(dockerfileTmpFolder, 0700); err != nil {
-		return "", fmt.Errorf("failed to create %s: %s", dockerfileTmpFolder, err)
-	}
-
-	tmpFile, err := ioutil.TempFile(dockerfileTmpFolder, "buildkit-")
-	if err != nil {
 		return "", err
 	}
 
-	datawriter := bufio.NewWriter(tmpFile)
-	defer datawriter.Flush()
-
-	userID := okteto.GetUserID()
-	if len(userID) == 0 {
-		userID = "anonymous"
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		traslatedLine := translateCacheHandler(line, userID)
-		_, _ = datawriter.WriteString(traslatedLine + "\n")
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-
-	return tmpFile.Name(), nil
-}
-
-func translateCacheHandler(input string, userID string) string {
-	matched, err := regexp.MatchString(`^RUN.*--mount=.*type=cache`, input)
-	if err != nil {
-		return input
-	}
-	if matched {
-		matched, err = regexp.MatchString(`^RUN.*--mount=id=`, input)
-		if err != nil {
-			return input
-		}
-		if matched {
-			return strings.Replace(input, "--mount=id=", fmt.Sprintf("--mount=id=%s-", userID), -1)
-		}
-		matched, err = regexp.MatchString(`^RUN.*--mount=[^ ]+,id=`, input)
-		if err != nil {
-			return input
-		}
-		if matched {
-			return strings.Replace(input, ",id=", fmt.Sprintf(",id=%s-", userID), -1)
-		}
-		return strings.Replace(input, "--mount=", fmt.Sprintf("--mount=id=%s,", userID), -1)
-	}
-	return input
+	return solveResp.ExporterResponse["containerimage.digest"], nil
 }
